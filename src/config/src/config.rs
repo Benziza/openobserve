@@ -2265,6 +2265,8 @@ pub struct Limit {
     pub metrics_max_series_response: usize,
     #[env_config(name = "ZO_METRICS_CACHE_MAX_ENTRIES", default = 10000)]
     pub metrics_cache_max_entries: usize,
+    #[env_config(name = "ZO_RESULT_CACHE_MAX_ENTRIES_PER_KEY", default = 10)]
+    pub result_cache_max_entries_per_key: usize,
     // Memory budget in MB for the PromQL series label cache. 0 (default)
     // means auto: 5% of total memory, clamped to [100, 1024] MB.
     #[env_config(name = "ZO_METRICS_LABEL_CACHE_MAX_SIZE", default = 0)]
@@ -3560,6 +3562,11 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
     if cfg.limit.metrics_cache_max_entries == 0 {
         cfg.limit.metrics_cache_max_entries = 10_000;
+    }
+
+    // check for result cache limit
+    if cfg.limit.result_cache_max_entries_per_key == 0 {
+        cfg.limit.result_cache_max_entries_per_key = 10;
     }
 
     // check search job retention
