@@ -19,7 +19,7 @@ use arrow_schema::Field;
 use config::{
     FileFormat, TIMESTAMP_COL_NAME, get_batch_size, get_config,
     meta::{
-        promql::{EXEMPLARS_LABEL, HASH_LABEL},
+        promql::{EXEMPLARS_LABEL, HASH_LABEL, STREAMING_AGG_TABLE_SUFFIX},
         search::{Session as SearchSession, StorageType},
         stream::{FileKey, StreamType},
     },
@@ -514,17 +514,36 @@ pub async fn register_metrics_table(
     schema: Arc<Schema>,
     table_name: &str,
     files: Vec<FileKey>,
+    sort_order: FileSortOrder,
 ) -> Result<SessionContext> {
     let schema = metrics_query_schema(schema);
     let ctx = DataFusionContextBuilder::new()
         .trace_id(&session.id)
         .work_group(session.work_group.clone())
         .stream_type(StreamType::Metrics)
+        .sort_order(sort_order)
         .build(session.target_partitions)
         .await?;
 
+    let file_stat_cache = ctx.runtime_env().cache_manager.get_file_statistic_cache();
+    // The ordered table is registered separately: declaring the ordering on the
+    // main table would split its scan into one file group per overlapping file,
+    // changing the unsorted path's partitioning.
+    if sort_order.is_sorted() {
+        let tables = TableBuilder::new()
+            .sort_order(sort_order)
+            .file_stat_cache(file_stat_cache.clone())
+            .build(session.clone(), files.clone(), schema.clone())
+            .await?;
+        let union_table = Arc::new(NewUnionTable::new(schema.clone(), tables));
+        ctx.register_table(
+            format!("{table_name}{STREAMING_AGG_TABLE_SUFFIX}"),
+            union_table,
+        )?;
+    }
+
     let tables = TableBuilder::new()
-        .file_stat_cache(ctx.runtime_env().cache_manager.get_file_statistic_cache())
+        .file_stat_cache(file_stat_cache)
         .build(session.clone(), files, schema.clone())
         .await?;
     let union_table = Arc::new(NewUnionTable::new(schema, tables));
@@ -1481,7 +1500,9 @@ mod tests {
                 row_group_size: None,
             }];
 
-            let result = register_metrics_table(&session, schema, "test_table", files).await;
+            let result =
+                register_metrics_table(&session, schema, "test_table", files, FileSortOrder::None)
+                    .await;
 
             // Should create context successfully
             assert!(result.is_ok());

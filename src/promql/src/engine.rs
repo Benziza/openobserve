@@ -59,6 +59,17 @@ pub struct Engine {
     result_type: Option<String>,
 }
 
+/// A recognized `agg(range_func(...))` expression, the shape the fused and
+/// streaming evaluators accept.
+struct FusedAggShape<'a> {
+    op: fused::FusedAggOp,
+    func: Arc<dyn functions::RangeFunc>,
+    range_arg: &'a PromExpr,
+    /// Set when the range argument is a plain matrix selector, the only
+    /// argument shape the streaming evaluator can plan.
+    matrix_selector: Option<&'a MatrixSelector>,
+}
+
 impl Engine {
     pub fn new(trace_id: &str, ctx: Arc<PromqlContext>, eval_ctx: EvalContext) -> Self {
         Self {
@@ -596,18 +607,7 @@ impl Engine {
             selector.to_string(),
         );
 
-        let mut filters = selector
-            .matchers
-            .matchers
-            .iter()
-            .filter_map(|mat| {
-                if mat.op == MatchOp::Equal {
-                    Some((mat.name.to_string(), vec![mat.value.to_string()]))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<(_, _)>>();
+        let mut filters = equal_matcher_filters(&selector.matchers);
 
         // check for super cluster
         let trace_id = self.ctx.query_ctx.trace_id.clone();
@@ -837,25 +837,26 @@ impl Engine {
         param: &Option<Box<PromExpr>>,
         modifier: &Option<LabelModifier>,
     ) -> Result<Value> {
-        // Fold range-function output straight into the aggregation instead of
-        // materializing per-series samples; every other shape stays generic.
-        if config::get_config()
-            .search
-            .feature_metrics_fused_agg_enabled
-            && let Some(agg_op) = fused::FusedAggOp::from_token(op.id())
-            && let PromExpr::Call(Call { func, args }) = expr
-            && args.len() == 1
-            && let Some(range_func) = functions::fusable_range_func(func.name)
-        {
-            let range_arg = args
-                .last()
-                .expect("promql-parser validated the function argument");
-            let range_input = self.exec_expr(&range_arg).await?;
+        // fused shapes fold the range function into the aggregation; others stay generic
+        if let Some(shape) = fused_agg_shape(op, expr) {
+            if let Some(matrix_selector) = shape.matrix_selector
+                && let Some(value) = self
+                    .try_streaming_fused_agg(
+                        matrix_selector,
+                        modifier,
+                        shape.func.clone(),
+                        shape.op,
+                    )
+                    .await?
+            {
+                return Ok(value);
+            }
+            let range_input = self.exec_expr(shape.range_arg).await?;
             return fused::fused_range_agg(
                 modifier,
                 range_input,
-                range_func.as_ref(),
-                agg_op,
+                shape.func.as_ref(),
+                shape.op,
                 &self.eval_ctx,
             );
         }
@@ -931,6 +932,105 @@ impl Engine {
                 )));
             }
         })
+    }
+
+    /// Attempts the streaming fused path: series arrive whole from
+    /// `(__hash__, _timestamp)` ordered scans and fold straight into the
+    /// aggregation, so the sample matrix is never materialized. `None` means
+    /// the query shape or the storage layout requires the materializing path.
+    async fn try_streaming_fused_agg(
+        &mut self,
+        matrix_selector: &MatrixSelector,
+        modifier: &Option<LabelModifier>,
+        func: Arc<dyn functions::RangeFunc>,
+        op: fused::FusedAggOp,
+    ) -> Result<Option<Value>> {
+        let query_ctx = &self.ctx.query_ctx;
+        // need_wal bails early: WAL would split series and double the context-creation cost
+        if !config::get_config()
+            .search
+            .feature_metrics_streaming_agg_enabled
+            || query_ctx.query_exemplars
+            || query_ctx.query_data
+            || query_ctx.is_super_cluster
+            || query_ctx.need_wal
+        {
+            return Ok(None);
+        }
+        let MatrixSelector { vs, range } = matrix_selector;
+        let range = *range;
+        let mut selector = vs.clone();
+        remove_filter_all(&mut selector);
+        if !selector.matchers.or_matchers.is_empty() || selector.at.is_some() {
+            return Ok(None);
+        }
+        if selector.name.is_none() {
+            let names = selector.matchers.find_matchers(NAME_LABEL);
+            let Some(matcher) = names.first() else {
+                return Ok(None);
+            };
+            selector.name = Some(matcher.value.clone());
+            selector
+                .matchers
+                .matchers
+                .retain(|mat| mat.name != NAME_LABEL);
+        }
+        let table_name = selector.name.clone().unwrap();
+
+        let offset = get_offset_modifier(selector.offset.clone());
+        let start = self.ctx.start - micros(range) - offset;
+        let end = self.ctx.end - offset;
+        let mut filters = equal_matcher_filters(&selector.matchers);
+        let mut label_selector = self.label_selector.clone();
+        label_selector.extend(self.ctx.label_selector.iter().cloned());
+
+        let ctxs = self
+            .ctx
+            .table_provider
+            .create_context(
+                &query_ctx.org_id,
+                &table_name,
+                (start, end),
+                selector.matchers.clone(),
+                label_selector,
+                &mut filters,
+            )
+            .await?;
+        // a second context would split series and evaluate rate windows on partial data
+        if ctxs.len() != 1 {
+            return Ok(None);
+        }
+        let (ctx, schema, scan_stats, keep_filters) = ctxs.into_iter().next().unwrap();
+        if !keep_filters {
+            selector.matchers = Matchers::empty();
+        }
+
+        let value = fused::streaming_fused_agg(
+            &ctx,
+            &schema,
+            fused::StreamingSelector {
+                table_name: &table_name,
+                matchers: &selector.matchers,
+                start: self.eval_ctx.start - offset,
+                end: self.eval_ctx.end - offset,
+                step: self.eval_ctx.step,
+                lookback: micros(range),
+                offset,
+            },
+            fused::FusedShape { op, func, range },
+            modifier,
+            &self.eval_ctx,
+            query_ctx.timeout,
+        )
+        .await?;
+        if value.is_some() {
+            let mut ctx_scan_stats = self.ctx.scan_stats.write().await;
+            ctx_scan_stats.add(&scan_stats);
+            if self.result_type.is_none() {
+                self.result_type = Some("matrix".to_string());
+            }
+        }
+        Ok(value)
     }
 
     async fn call_expr_first_arg(&mut self, args: &FunctionArgs) -> Result<Value> {
@@ -1316,6 +1416,51 @@ fn collect_loaded_metrics(mut results: Vec<LoadedMetrics>) -> Vec<RangeValue> {
     } else {
         merge_loaded_metrics(results).into_values().collect()
     }
+}
+
+fn fused_agg_shape<'a>(op: &token::TokenType, expr: &'a PromExpr) -> Option<FusedAggShape<'a>> {
+    if !config::get_config()
+        .search
+        .feature_metrics_fused_agg_enabled
+    {
+        return None;
+    }
+    let agg_op = fused::FusedAggOp::from_token(op.id())?;
+    let PromExpr::Call(Call { func, args }) = expr else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let range_func = functions::fusable_range_func(func.name)?;
+    let range_arg: &PromExpr = args
+        .args
+        .last()
+        .expect("promql-parser validated the function argument");
+    let matrix_selector = match range_arg {
+        PromExpr::MatrixSelector(matrix_selector) => Some(matrix_selector),
+        _ => None,
+    };
+    Some(FusedAggShape {
+        op: agg_op,
+        func: Arc::from(range_func),
+        range_arg,
+        matrix_selector,
+    })
+}
+
+fn equal_matcher_filters(matchers: &Matchers) -> Vec<(String, Vec<String>)> {
+    matchers
+        .matchers
+        .iter()
+        .filter_map(|mat| {
+            if mat.op == MatchOp::Equal {
+                Some((mat.name.to_string(), vec![mat.value.to_string()]))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Merge series that may occur in more than one DataFusion context. Contexts

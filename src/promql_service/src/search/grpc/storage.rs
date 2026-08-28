@@ -30,9 +30,10 @@ use infra::{
     schema::{get_partition_time_level, unwrap_stream_settings},
 };
 use itertools::Itertools;
+use metrics_index::MetricsFileLayout;
 use promql_parser::label::Matchers;
 use search::{
-    datafusion::exec::register_metrics_table,
+    datafusion::{exec::register_metrics_table, sort_order::FileSortOrder},
     file_cache::{cache_files, calc_target_partitions},
 };
 use search_service::match_source;
@@ -228,7 +229,20 @@ pub(crate) async fn create_context(
         target_partitions,
     };
 
-    let ctx = register_metrics_table(&session, schema.clone(), stream_name, files).await?;
+    // Streaming aggregation needs every file's rows ordered by
+    // (__hash__, _timestamp); one legacy file voids the guarantee.
+    let sort_order = if cfg.search.feature_metrics_streaming_agg_enabled
+        && files
+            .iter()
+            .all(|file| MetricsFileLayout::of(&file.key).is_some())
+    {
+        FileSortOrder::HashTimestampAsc
+    } else {
+        FileSortOrder::None
+    };
+
+    let ctx =
+        register_metrics_table(&session, schema.clone(), stream_name, files, sort_order).await?;
 
     // the matchers are always applied by the query: sidecar selections are
     // exact at series-run granularity only, and other files are scanned in full
